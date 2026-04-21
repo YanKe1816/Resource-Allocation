@@ -65,15 +65,141 @@ def _mcp_result(result: dict, request_id):
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
-def _mcp_error(code: int, message: str, request_id=None, structured=None):
+def _mcp_error(code: int, message: str, request_id=None, data=None):
     payload = {
         "jsonrpc": "2.0",
         "id": request_id,
         "error": {"code": code, "message": message},
     }
-    if structured is not None:
-        payload["error"]["data"] = {"structuredContent": structured}
+    if data is not None:
+        payload["error"]["data"] = data
     return payload
+
+
+
+
+def _initialize_response(request_id):
+    return _mcp_result(
+        {
+            "protocolVersion": "2024-11-05",
+            "serverInfo": {
+                "name": "resource-allocation-mcp",
+                "version": "1.0.0",
+            },
+            "capabilities": {
+                "tools": {},
+            },
+        },
+        request_id,
+    )
+
+def _tools_list_response(request_id):
+    return _mcp_result(
+        {
+            "tools": [
+                {
+                    "name": "resource_allocation",
+                    "description": "Allocate resources across options to maximize return",
+                    "annotations": {
+                        "readOnlyHint": True,
+                        "destructiveHint": False,
+                        "openWorldHint": False,
+                    },
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "total_resource": {"type": "number"},
+                            "options": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "return": {"type": "number"},
+                                    },
+                                    "required": ["name", "return"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": ["total_resource", "options"],
+                        "additionalProperties": False,
+                    },
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "allocation": {
+                                "type": "object",
+                                "additionalProperties": {"type": "number"},
+                            },
+                            "reason": {"type": "string"},
+                            "confidence": {"type": "number"},
+                        },
+                        "required": ["allocation", "reason", "confidence"],
+                        "additionalProperties": False,
+                    },
+                }
+            ]
+        },
+        request_id,
+    )
+
+
+def _tools_call_response(params, request_id):
+    if not isinstance(params, dict):
+        return _mcp_error(-32602, "Invalid params", request_id, {"reason": "params must be an object"})
+
+    tool_name = params.get("name")
+    arguments = params.get("arguments", {})
+
+    if tool_name != "resource_allocation":
+        return _mcp_error(-32601, "Tool not found", request_id)
+
+    if not isinstance(arguments, dict):
+        return _mcp_error(-32602, "Invalid params", request_id, {"reason": "arguments must be an object"})
+
+    total_resource = arguments.get("total_resource")
+    options = arguments.get("options")
+
+    if total_resource is None or options is None:
+        return _mcp_error(
+            -32602,
+            "Missing required fields",
+            request_id,
+            {"reason": "Missing required field(s): total_resource and/or options"},
+        )
+
+    if not isinstance(total_resource, (int, float)) or float(total_resource) < 0:
+        return _mcp_error(
+            -32602,
+            "Invalid total_resource",
+            request_id,
+            {"reason": "total_resource must be a number greater than or equal to 0"},
+        )
+
+    option_error = _validate_options(options)
+    if option_error:
+        return _mcp_error(-32602, "Invalid options", request_id, {"reason": option_error})
+
+    allocation, reason, confidence = _allocate(float(total_resource), options)
+    structured = {
+        "allocation": allocation,
+        "reason": reason,
+        "confidence": confidence,
+    }
+
+    return _mcp_result(
+        {
+            "structuredContent": structured,
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(structured, ensure_ascii=False),
+                }
+            ],
+        },
+        request_id,
+    )
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -108,144 +234,27 @@ class AppHandler(BaseHTTPRequestHandler):
         except Exception:
             return _json_response(self, 400, _mcp_error(-32700, "Parse error", None))
 
+        if not isinstance(request, dict):
+            return _json_response(self, 400, _mcp_error(-32600, "Invalid Request", None))
+
         request_id = request.get("id")
+        if request.get("jsonrpc") != "2.0":
+            return _json_response(self, 400, _mcp_error(-32600, "Invalid Request", request_id))
+
         method = request.get("method")
-        params = request.get("params", {}) if isinstance(request, dict) else {}
+        if not isinstance(method, str):
+            return _json_response(self, 400, _mcp_error(-32600, "Invalid Request", request_id))
+
+        params = request.get("params", {})
+
+        if method == "initialize":
+            return _json_response(self, 200, _initialize_response(request_id))
 
         if method == "tools/list":
-            return _json_response(
-                self,
-                200,
-                _mcp_result(
-                    {
-                        "tools": [
-                            {
-                                "name": "resource_allocation",
-                                "description": "Allocate total resources across options to maximize return",
-                                "annotations": {
-                                    "readOnlyHint": True,
-                                    "destructiveHint": True,
-                                    "openWorldHint": False,
-                                },
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "total_resource": {"type": "number"},
-                                        "options": {
-                                            "type": "array",
-                                            "items": {
-                                                "type": "object",
-                                                "properties": {
-                                                    "name": {"type": "string"},
-                                                    "return": {"type": "number"},
-                                                },
-                                                "required": ["name", "return"],
-                                                "additionalProperties": False,
-                                            },
-                                        },
-                                    },
-                                    "required": ["total_resource", "options"],
-                                    "additionalProperties": False,
-                                },
-                                "outputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "allocation": {
-                                            "type": "object",
-                                            "additionalProperties": {"type": "number"},
-                                        },
-                                        "reason": {"type": "string"},
-                                        "confidence": {"type": "number"},
-                                    },
-                                    "required": ["allocation", "reason", "confidence"],
-                                    "additionalProperties": False,
-                                },
-                            }
-                        ]
-                    },
-                    request_id,
-                ),
-            )
+            return _json_response(self, 200, _tools_list_response(request_id))
 
         if method == "tools/call":
-            if not isinstance(params, dict):
-                return _json_response(
-                    self,
-                    200,
-                    _mcp_error(-32602, "Invalid params", request_id, {"reason": "params must be an object"}),
-                )
-
-            tool_name = params.get("name")
-            arguments = params.get("arguments", {})
-
-            if tool_name != "resource_allocation":
-                return _json_response(self, 200, _mcp_error(-32601, "Tool not found", request_id))
-
-            if not isinstance(arguments, dict):
-                return _json_response(
-                    self,
-                    200,
-                    _mcp_error(-32602, "Invalid params", request_id, {"reason": "arguments must be an object"}),
-                )
-
-            total_resource = arguments.get("total_resource")
-            options = arguments.get("options")
-
-            if total_resource is None or options is None:
-                return _json_response(
-                    self,
-                    200,
-                    _mcp_error(
-                        -32602,
-                        "Missing required fields",
-                        request_id,
-                        {"reason": "Missing required field(s): total_resource and/or options"},
-                    ),
-                )
-
-            if not isinstance(total_resource, (int, float)) or float(total_resource) < 0:
-                return _json_response(
-                    self,
-                    200,
-                    _mcp_error(
-                        -32602,
-                        "Invalid total_resource",
-                        request_id,
-                        {"reason": "total_resource must be a number greater than or equal to 0"},
-                    ),
-                )
-
-            option_error = _validate_options(options)
-            if option_error:
-                return _json_response(
-                    self,
-                    200,
-                    _mcp_error(-32602, "Invalid options", request_id, {"reason": option_error}),
-                )
-
-            allocation, reason, confidence = _allocate(float(total_resource), options)
-            structured = {
-                "allocation": allocation,
-                "reason": reason,
-                "confidence": confidence,
-            }
-
-            return _json_response(
-                self,
-                200,
-                _mcp_result(
-                    {
-                        "structuredContent": structured,
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": json.dumps(structured, ensure_ascii=False),
-                            }
-                        ],
-                    },
-                    request_id,
-                ),
-            )
+            return _json_response(self, 200, _tools_call_response(params, request_id))
 
         return _json_response(self, 200, _mcp_error(-32601, "Method not found", request_id))
 
